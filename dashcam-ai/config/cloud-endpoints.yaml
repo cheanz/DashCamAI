@@ -1,0 +1,21 @@
+# Cloud Endpoints
+# No secrets here — inject credentials via environment variables at runtime.
+# See deployment docs for secret management approach.
+
+llm:
+  endpoint: "https://api.your-llm-provider.com/v1/chat"   # TODO: set provider
+  model: "gpt-4o"                                           # TODO: confirm model
+  timeout_ms: 5000
+  max_retries: 2
+  streaming: true                                           # For lower time-to-first-token
+
+storage:
+  provider: aws_s3
+  bucket: "dashcam-ai-evidence"                             # TODO: set bucket name
+  region: "us-west-2"                                       # TODO: set region
+  prefix: "clips/"
+
+# Credentials — set as environment variables, never hardcoded:
+#   LLM_API_KEY
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY

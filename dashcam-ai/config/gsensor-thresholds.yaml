@@ -1,0 +1,15 @@
+# G-Sensor Impact Thresholds
+# Units: milli-g (1g = 1000 mg)
+# Tune these values during hardware validation.
+
+driving:
+  collision_threshold_mg: 350      # High-confidence collision — trigger clip preservation
+  near_miss_threshold_mg: 150      # Near-miss — log event, preserve clip, no alert
+
+parked:
+  wake_threshold_mg: 250           # Wake SoC from suspend-to-RAM
+  # Lower than driving threshold — parked impacts (e.g., parking lot bump) are slower-speed
+
+debounce:
+  min_event_gap_ms: 2000           # Ignore repeated events within this window
+  driving_to_parked_ms: 60000      # Inactivity before MCU transitions to PARKED state

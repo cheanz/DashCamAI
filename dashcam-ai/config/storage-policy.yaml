@@ -1,0 +1,26 @@
+# Storage Policy — eMMC / SD Card
+# Managed by storage-daemon. All values are defaults; tune per device SKU.
+
+loop_recording:
+  max_size_gb: 28                  # Leave headroom for clips, queue, OS
+  segment_duration_s: 60           # Each loop file = 1 minute of footage
+  pre_event_buffer_s: 30           # Rolling pre-collision buffer preserved on event
+
+evidence_clips:
+  max_count: 200                   # Hard cap on preserved clips
+  post_event_duration_s: 30        # Seconds captured after collision trigger
+  never_auto_evict: true           # Evidence clips require explicit user deletion
+
+offline_queue:
+  max_entries: 50                  # Max queued translation requests
+  entry_ttl_days: 7                # Entries older than this are evicted
+  max_size_mb: 10                  # Failsafe size cap
+
+eviction_priority:
+  # Order: 1 = evicted last, 3 = evicted first
+  - name: evidence_clips
+    priority: 1
+  - name: offline_queue
+    priority: 2
+  - name: loop_footage
+    priority: 3
