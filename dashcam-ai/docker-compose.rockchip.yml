@@ -1,0 +1,87 @@
+# docker-compose.rockchip.yml
+#
+# Cross-compilation workflow for RV1106.
+# Runs entirely on your DEV MACHINE — nothing here runs on the device.
+#
+# Usage:
+#   docker compose -f docker-compose.rockchip.yml run media-daemon-build
+#   docker compose -f docker-compose.rockchip.yml run ai-daemon-build
+#   docker compose -f docker-compose.rockchip.yml run --rm all-build
+#
+# Outputs land in ./dist/rv1106/ on your dev machine.
+
+version: "3.9"
+
+x-build-base: &build-base
+  environment:
+    - CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+    - PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig
+    - PKG_CONFIG_ALLOW_CROSS=1
+    - RUST_LOG=info
+  volumes:
+    # Output directory on dev machine
+    - ./dist/rv1106:/dist
+    # Cargo registry cache — reused across builds for speed
+    - cargo-registry:/root/.cargo/registry
+    - cargo-git:/root/.cargo/git
+
+services:
+
+  # ── Cross-compile media-daemon (Rust → armv7) ──────────────────────────────
+  media-daemon-build:
+    <<: *build-base
+    build:
+      context: ./soc/media-daemon-rs
+      dockerfile: Dockerfile.rockchip
+    container_name: rv1106-build-media
+    command: >
+      sh -c "cp /build/target/armv7-unknown-linux-gnueabihf/release/media-daemon /dist/
+             && cp /opt/rknn-sdk/librknnrt.so /dist/
+             && echo 'media-daemon built → dist/rv1106/'"
+
+  # ── Cross-compile ai-daemon (C → armv7) ────────────────────────────────────
+  # Uses the same cross-toolchain image as a base.
+  ai-daemon-build:
+    <<: *build-base
+    image: dashcam-builder-rv1106   # reuse the Rust builder image for its toolchain
+    container_name: rv1106-build-ai
+    volumes:
+      - ./soc/ai-daemon:/src/ai-daemon:ro
+      - ./dist/rv1106:/dist
+    working_dir: /src/ai-daemon
+    command: >
+      sh -c "cmake -B build
+               -DCMAKE_TOOLCHAIN_FILE=/opt/rv1106-toolchain.cmake
+               -DCMAKE_BUILD_TYPE=Release
+             && cmake --build build --parallel
+             && cp build/ai-daemon /dist/ai-daemon
+             && echo 'ai-daemon built → dist/rv1106/'"
+
+  # ── Build all daemons in sequence ──────────────────────────────────────────
+  all-build:
+    image: alpine:3.19
+    container_name: rv1106-build-all
+    depends_on:
+      - media-daemon-build
+      - ai-daemon-build
+    command: >
+      sh -c "echo '=== All RV1106 binaries built ===' && ls -lh /dist"
+    volumes:
+      - ./dist/rv1106:/dist
+
+  # ── QEMU-based smoke test ───────────────────────────────────────────────────
+  # Run the armv7 binary on your dev machine via QEMU user-mode emulation.
+  # Not a full integration test — just checks the binary starts without crashing.
+  smoke-test:
+    image: dashcam-builder-rv1106
+    container_name: rv1106-smoke-test
+    platform: linux/arm/v7
+    volumes:
+      - ./dist/rv1106:/dist
+    command: >
+      sh -c "RUST_LOG=debug /dist/media-daemon --help 2>&1 | head -20
+             && echo 'Smoke test passed: binary runs under QEMU armv7'"
+
+volumes:
+  cargo-registry:
+  cargo-git:

@@ -1,5 +1,8 @@
 mod capture;
-mod encoder;
+mod encoder_common;
+#[cfg(feature = "jetson")]   mod encoder_gstreamer;
+#[cfg(feature = "rockchip")] mod encoder_mpp;
+mod encoder;   // thin dispatcher — re-exports the active backend
 mod loop_writer;
 mod audio;
 mod shm;

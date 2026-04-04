@@ -1,0 +1,27 @@
+# /etc/systemd/system/dashcam-event-bus.service
+# Starts the Unix socket event bus before any daemon.
+# Replace socat with the real event-bus binary once implemented.
+
+[Unit]
+Description=DashCam AI — Event Bus
+After=local-fs.target
+
+[Service]
+Type=simple
+User=dashcam
+Group=dashcam
+
+ExecStartPre=/bin/mkdir -p /var/run/dashcam
+ExecStart=/usr/bin/socat \
+    UNIX-LISTEN:/var/run/dashcam/event_bus.sock,fork,reuseaddr,mode=0660 \
+    PIPE
+
+Restart=always
+RestartSec=1s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dashcam-event-bus
+
+[Install]
+WantedBy=multi-user.target

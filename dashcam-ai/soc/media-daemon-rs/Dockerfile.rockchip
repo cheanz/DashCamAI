@@ -1,0 +1,137 @@
+# ── Rockchip RV1106 Cross-Compilation Environment ────────────────────────────
+#
+# This Dockerfile runs on your DEV MACHINE (x86_64 or ARM64 Mac/Linux).
+# It cross-compiles the Rust media-daemon for the RV1106 target:
+#
+#   Architecture : ARM Cortex-A7 (32-bit, hard-float)
+#   Rust target  : armv7-unknown-linux-gnueabihf
+#   C toolchain  : arm-linux-gnueabihf-gcc (Linaro)
+#
+# The RV1106 itself runs a minimal Buildroot Linux — Docker does NOT run there.
+# This container produces a statically-linked binary you deploy via SCP/flash.
+#
+# Usage:
+#   docker build -f Dockerfile.rockchip -t dashcam-builder-rv1106 .
+#   docker run --rm -v $(pwd)/dist:/dist dashcam-builder-rv1106
+#   # Binary appears in ./dist/media-daemon
+#
+# Then deploy:
+#   scp dist/media-daemon root@<RV1106_IP>:/usr/bin/media-daemon
+
+FROM ubuntu:22.04 AS cross-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Install cross-compilation toolchain ───────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Linaro ARM hard-float cross-compiler
+    gcc-arm-linux-gnueabihf \
+    g++-arm-linux-gnueabihf \
+    binutils-arm-linux-gnueabihf \
+    # Build essentials
+    build-essential \
+    pkg-config \
+    cmake \
+    make \
+    curl \
+    ca-certificates \
+    git \
+    # For building C libraries targeting armv7
+    crossbuild-essential-armhf \
+    # QEMU for optional on-target testing via binfmt
+    qemu-user-static \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Install Rust with armv7 target ───────────────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN rustup target add armv7-unknown-linux-gnueabihf
+
+# Tell Cargo which linker to use for the cross target
+RUN mkdir -p /root/.cargo && cat >> /root/.cargo/config.toml <<'EOF'
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+EOF
+
+# ── Cross-compile ALSA for armv7 ─────────────────────────────────────────────
+# We need the armv7 version of libasound for linking.
+# Use dpkg --add-architecture to pull armhf packages.
+RUN dpkg --add-architecture armhf \
+    && apt-get update \
+    && apt-get install -y \
+        libasound2-dev:armhf \
+        libv4l-dev:armhf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tell pkg-config to find armhf libraries
+ENV PKG_CONFIG_PATH="/usr/lib/arm-linux-gnueabihf/pkgconfig"
+ENV PKG_CONFIG_ALLOW_CROSS=1
+
+# ── Install RKNN SDK (Rockchip NPU runtime) ───────────────────────────────────
+# Download the RKNN Toolkit Lite2 from Rockchip's GitHub.
+# The runtime library (librknnrt.so) must be present on the RV1106 rootfs too.
+#
+# Source: https://github.com/rockchip-linux/rknn-toolkit2
+ARG RKNN_SDK_VERSION=2.0.0b0
+RUN mkdir -p /opt/rknn-sdk \
+    && curl -fsSL \
+        "https://github.com/rockchip-linux/rknn-toolkit2/raw/master/rknpu2/runtime/Linux/librknn_api/armhf/librknnrt.so" \
+        -o /opt/rknn-sdk/librknnrt.so \
+    && curl -fsSL \
+        "https://github.com/rockchip-linux/rknn-toolkit2/raw/master/rknpu2/runtime/Linux/librknn_api/include/rknn_api.h" \
+        -o /opt/rknn-sdk/rknn_api.h \
+    && cp /opt/rknn-sdk/librknnrt.so \
+          /usr/lib/arm-linux-gnueabihf/librknnrt.so \
+    && cp /opt/rknn-sdk/rknn_api.h \
+          /usr/include/rknn_api.h
+
+# ── Install Rockchip MPP (hardware video codec) ───────────────────────────────
+# MPP is Rockchip's Media Process Platform — used by encoder.rs.
+# Build from source targeting armhf.
+RUN git clone --depth 1 https://github.com/rockchip-linux/mpp.git /opt/mpp-src \
+    && cmake -S /opt/mpp-src -B /opt/mpp-build \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=arm \
+        -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
+        -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
+        -DCMAKE_INSTALL_PREFIX=/usr/arm-linux-gnueabihf \
+        -DHAVE_DRM=OFF \
+        -DBUILD_TEST=OFF \
+    && cmake --build /opt/mpp-build --parallel $(nproc) \
+    && cmake --install /opt/mpp-build
+
+# ── Build the Rust media-daemon ───────────────────────────────────────────────
+WORKDIR /build
+
+# Cache dependencies layer (rebuilt only when Cargo.toml changes)
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --target armv7-unknown-linux-gnueabihf \
+    && rm -rf src
+
+# Build for real
+COPY src ./src
+RUN touch src/main.rs \
+    && cargo build --release --target armv7-unknown-linux-gnueabihf
+
+# ── Output stage ─────────────────────────────────────────────────────────────
+# Copy artifacts to /dist so the caller can bind-mount it:
+#   docker run --rm -v $(pwd)/dist:/dist dashcam-builder-rv1106
+FROM scratch AS artifacts
+COPY --from=cross-builder \
+    /build/target/armv7-unknown-linux-gnueabihf/release/media-daemon \
+    /media-daemon
+COPY --from=cross-builder /opt/rknn-sdk/librknnrt.so /lib/librknnrt.so
+
+# Default: copy artifacts and exit
+FROM ubuntu:22.04 AS exporter
+COPY --from=cross-builder \
+    /build/target/armv7-unknown-linux-gnueabihf/release/media-daemon \
+    /dist/media-daemon
+COPY --from=cross-builder \
+    /opt/rknn-sdk/librknnrt.so \
+    /dist/librknnrt.so
+
+CMD ["sh", "-c", "echo 'Build complete. Artifacts in /dist:' && ls -lh /dist"]

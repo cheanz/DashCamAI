@@ -1,0 +1,57 @@
+# /etc/systemd/system/media-daemon.service
+# systemd unit for media-daemon on Jetson (bare Linux / JetPack)
+#
+# Install:
+#   sudo cp media-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now media-daemon
+#
+# Logs:
+#   journalctl -u media-daemon -f
+
+[Unit]
+Description=DashCam AI — Media Daemon (camera + audio)
+Documentation=https://github.com/your-org/dashcam-ai
+After=network.target sound.target
+# Wait for event bus to be ready before starting
+After=dashcam-event-bus.service
+Requires=dashcam-event-bus.service
+
+[Service]
+Type=simple
+User=dashcam
+Group=dashcam
+
+ExecStart=/usr/local/bin/media-daemon
+
+# Environment
+Environment=RUST_LOG=info
+Environment=DASHCAM_VIDEO_DEVICE=/dev/video0
+Environment=DASHCAM_AUDIO_DEVICE=hw:0,0
+Environment=DASHCAM_LOOP_DIR=/mnt/emmc/loop
+
+# Give dashcam user access to video and audio devices
+SupplementaryGroups=video audio
+
+# Restart policy — restart immediately on crash (safety device)
+Restart=always
+RestartSec=2s
+
+# Resource limits
+# Shared memory for video ring buffer
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=media-daemon
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/mnt/emmc /var/run/dashcam
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
