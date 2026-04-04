@@ -1,0 +1,72 @@
+# ===== Build =====
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.out
+*.elf
+*.bin
+*.hex
+*.map
+
+# ===== Rust / Cargo =====
+target/
+Cargo.lock
+**/*.rs.bk
+
+# ===== Python (scripts/tools) =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== Docker =====
+.docker/
+
+# ===== Models / Large files =====
+models/*.onnx
+models/*.tflite
+models/*.engine
+models/*.rknn
+models/*.pt
+models/*.bin
+!models/README.md
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== Secrets / Config =====
+.env
+.env.*
+credentials.json
+*.pem
+*.key
+
+# ===== Logs / Runtime =====
+*.log
+logs/
+tmp/
+*.pid
+core
+core.*
