@@ -1,0 +1,178 @@
+# DashCam AI — Docker Compose
+#
+# Runs all SoC daemons as separate containers on the Jetson.
+# The MCU firmware (mcu/) is flashed separately and communicates
+# with the SoC over GPIO/UART — it does not run in Docker.
+#
+# Prerequisites:
+#   - NVIDIA Container Runtime installed (nvidia-container-toolkit)
+#   - JetPack matching the l4t-base tag in each Dockerfile
+#   - Camera at /dev/video0, audio at /dev/snd
+#
+# Start all services:
+#   docker compose up -d
+#
+# View logs:
+#   docker compose logs -f media-daemon
+#
+# Check your JetPack version:
+#   cat /etc/nv_tegra_release
+
+version: "3.9"
+
+# ── Shared configuration ──────────────────────────────────────────────────────
+
+x-jetson-base: &jetson-base
+  runtime: nvidia                   # NVIDIA Container Runtime — GPU + hardware codec access
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
+    - RUST_LOG=info
+  restart: unless-stopped
+
+x-common-volumes: &common-volumes
+  - dashcam-run:/var/run/dashcam    # Event bus Unix socket — shared by all daemons
+  - dashcam-emmc:/mnt/emmc         # eMMC storage — loop recording + evidence clips
+
+# ── Services ──────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── media-daemon (Rust) ─────────────────────────────────────────────────────
+  media-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/media-daemon-rs
+      dockerfile: Dockerfile
+    container_name: dashcam-media
+    devices:
+      - /dev/video0:/dev/video0     # Camera (Sony IMX via MIPI-CSI + ISP)
+      - /dev/snd:/dev/snd           # ALSA audio (mic array)
+    volumes:
+      - *common-volumes
+      # Shared memory for zero-copy video frame passing to ai-daemon
+      # --ipc=host is the simplest option; alternatively use a named shm volume
+    ipc: host
+    group_add:
+      - video                       # Access /dev/video*
+      - audio                       # Access /dev/snd
+    depends_on:
+      - event-bus
+
+  # ── ai-daemon (C) ───────────────────────────────────────────────────────────
+  # Handles NPU inference: YOLO-nano, Whisper STT, intent classifier, KWS.
+  # On Jetson: uses ONNX Runtime with CUDA instead of RKNN SDK.
+  ai-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/ai-daemon
+      dockerfile: Dockerfile        # TODO: create ai-daemon/Dockerfile
+    container_name: dashcam-ai
+    volumes:
+      - *common-volumes
+      - ./models:/models:ro         # Model weights — read-only
+    ipc: host                       # Reads video frames from shm ring
+    depends_on:
+      - event-bus
+      - media-daemon
+
+  # ── voice-daemon ────────────────────────────────────────────────────────────
+  voice-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/voice-daemon
+      dockerfile: Dockerfile        # TODO: create voice-daemon/Dockerfile
+    container_name: dashcam-voice
+    devices:
+      - /dev/snd:/dev/snd           # Speaker output (TTS playback)
+    volumes:
+      - *common-volumes
+      - ./models:/models:ro
+    group_add:
+      - audio
+    depends_on:
+      - event-bus
+      - ai-daemon
+
+  # ── cloud-daemon ─────────────────────────────────────────────────────────────
+  cloud-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/cloud-daemon
+      dockerfile: Dockerfile        # TODO: create cloud-daemon/Dockerfile
+    container_name: dashcam-cloud
+    volumes:
+      - *common-volumes
+    environment:
+      - RUST_LOG=info
+      - LLM_API_KEY=${LLM_API_KEY}            # injected from .env
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    network_mode: host              # LTE modem appears as a network interface
+    depends_on:
+      - event-bus
+      - storage-daemon
+
+  # ── storage-daemon ───────────────────────────────────────────────────────────
+  storage-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/storage-daemon
+      dockerfile: Dockerfile        # TODO: create storage-daemon/Dockerfile
+    container_name: dashcam-storage
+    volumes:
+      - *common-volumes
+      - ./config/storage-policy.yaml:/config/storage-policy.yaml:ro
+    depends_on:
+      - event-bus
+
+  # ── power-daemon ─────────────────────────────────────────────────────────────
+  power-daemon:
+    <<: *jetson-base
+    build:
+      context: ./soc/power-daemon
+      dockerfile: Dockerfile        # TODO: create power-daemon/Dockerfile
+    container_name: dashcam-power
+    devices:
+      # GPIO for MCU wake signal — device path varies by Jetson model
+      # Jetson Nano:      /dev/gpiochip0
+      # Jetson Xavier NX: /dev/gpiochip0, /dev/gpiochip1
+      - /dev/gpiochip0:/dev/gpiochip0
+      # UART to MCU
+      - /dev/ttyTHS1:/dev/ttyTHS1
+    volumes:
+      - *common-volumes
+    depends_on:
+      - event-bus
+
+  # ── event-bus broker ─────────────────────────────────────────────────────────
+  # Lightweight Unix socket broker — all daemons connect to this.
+  # Using socat as a minimal stand-in until a real broker is implemented.
+  # Replace with a dedicated event-bus binary once soc/shared/event_bus.c
+  # is built into its own binary.
+  event-bus:
+    image: alpine:3.19
+    container_name: dashcam-event-bus
+    command: >
+      sh -c "mkdir -p /var/run/dashcam &&
+             socat UNIX-LISTEN:/var/run/dashcam/event_bus.sock,fork,reuseaddr PIPE"
+    volumes:
+      - dashcam-run:/var/run/dashcam
+    restart: unless-stopped
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+
+volumes:
+  dashcam-run:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=64m                   # In-memory — sockets don't need persistence
+
+  dashcam-emmc:
+    driver: local
+    driver_opts:
+      type: none
+      device: /mnt/emmc             # Mount actual eMMC partition on the Jetson
+      o: bind
