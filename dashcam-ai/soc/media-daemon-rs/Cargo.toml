@@ -1,0 +1,52 @@
+[package]
+name    = "media-daemon"
+version = "0.1.0"
+edition = "2021"
+
+# Cross-compile target for RV1106 (ARM Cortex-A7, 32-bit)
+# Build with: cargo build --release --target armv7-unknown-linux-gnueabihf
+# Install cross-compiler: rustup target add armv7-unknown-linux-gnueabihf
+
+[[bin]]
+name = "media-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — event bus I/O, Unix socket IPC
+tokio          = { version = "1",    features = ["full"] }
+
+# V4L2 camera capture
+v4l            = "0.14"
+
+# ALSA audio capture
+alsa           = "0.7"
+
+# WebRTC VAD — voice activity detection
+webrtc-vad     = "0.4"
+
+# POSIX APIs (shared memory, signals, file descriptors)
+nix            = { version = "0.27", features = ["mman", "fs", "signal"] }
+
+# Error handling
+anyhow         = "1"
+thiserror      = "1"
+
+# Serialization for event bus messages
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Lock-free channels between threads
+crossbeam-channel  = "0.5"
+
+# Byte manipulation for frame data
+bytes = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = true     # Link-time optimisation — important on memory-constrained SoC
+codegen-units = 1        # Single codegen unit for best optimisation
+strip         = true     # Strip debug symbols from release binary
