@@ -195,3 +195,237 @@ impl EventBus {
         decode_event(&mut self.stream).await
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+    use std::os::unix::fs::PermissionsExt;
+
+    // ── encode_event wire format ──────────────────────────────────────────────
+
+    #[test]
+    fn test_encode_event_header_layout() {
+        let evt = DashcamEvent {
+            event_type:   EventType::SuspendAck,
+            timestamp_us: 0x0102_0304_0506_0708,
+            collision:    None,
+            intent:       None,
+            wake:         None,
+            llm:          None,
+        };
+
+        let buf = encode_event(&evt);
+
+        // Bytes 0..4 — event_type as u32 LE
+        let type_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(type_id, EventType::SuspendAck as u32);
+
+        // Bytes 4..12 — timestamp_us as u64 LE
+        let ts = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        assert_eq!(ts, 0x0102_0304_0506_0708);
+
+        // Bytes 12..16 — payload_len as u32 LE (SuspendAck has no payload)
+        let payload_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        assert_eq!(payload_len, 0);
+        assert_eq!(buf.len(), 16, "no-payload event must be exactly 16 bytes");
+    }
+
+    #[test]
+    fn test_encode_collision_event_includes_payload() {
+        let evt = DashcamEvent {
+            event_type:   EventType::CollisionDetected,
+            timestamp_us: 1_000_000,
+            collision: Some(CollisionPayload { confidence: 0.95, clip_id: 7 }),
+            intent: None, wake: None, llm: None,
+        };
+
+        let buf = encode_event(&evt);
+        assert!(buf.len() > 16, "collision event must carry a JSON payload");
+
+        let payload_len = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        assert_eq!(buf.len(), 16 + payload_len);
+
+        // The payload must round-trip through serde
+        let payload: CollisionPayload = serde_json::from_slice(&buf[16..]).unwrap();
+        assert!((payload.confidence - 0.95_f32).abs() < 1e-4);
+        assert_eq!(payload.clip_id, 7);
+    }
+
+    #[test]
+    fn test_encode_intent_event_includes_payload() {
+        let evt = DashcamEvent {
+            event_type:   EventType::IntentClassified,
+            timestamp_us: 2_000_000,
+            collision:    None,
+            intent: Some(IntentPayload {
+                transcript: "navigate home".into(),
+                lang:       "en".into(),
+                intent:     3,
+            }),
+            wake: None, llm: None,
+        };
+
+        let buf = encode_event(&evt);
+        let payload: IntentPayload = serde_json::from_slice(&buf[16..]).unwrap();
+        assert_eq!(payload.transcript, "navigate home");
+        assert_eq!(payload.lang, "en");
+        assert_eq!(payload.intent, 3);
+    }
+
+    #[test]
+    fn test_encode_llm_event_includes_payload() {
+        let evt = DashcamEvent {
+            event_type:   EventType::LlmResponseReady,
+            timestamp_us: 3_000_000,
+            collision:    None,
+            intent:       None,
+            wake:         None,
+            llm: Some(LlmPayload {
+                response: "Turn left in 200 metres".into(),
+                lang:     "zh".into(),
+            }),
+        };
+
+        let buf = encode_event(&evt);
+        let payload: LlmPayload = serde_json::from_slice(&buf[16..]).unwrap();
+        assert_eq!(payload.lang, "zh");
+    }
+
+    // ── encode / decode round-trip via in-process socket pair ─────────────────
+
+    #[tokio::test]
+    async fn test_encode_decode_round_trip_suspend_ack() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("event_bus.sock");
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let path_clone = sock_path.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            decode_event(&mut stream).await
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&path_clone).await.unwrap();
+        let evt = DashcamEvent::suspend_ack();
+        let encoded = encode_event(&evt);
+        client.write_all(&encoded).await.unwrap();
+
+        let decoded = server.await.unwrap().unwrap();
+        assert_eq!(decoded.event_type, EventType::SuspendAck);
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_round_trip_collision() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("event_bus2.sock");
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let path_clone = sock_path.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            decode_event(&mut stream).await
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&path_clone).await.unwrap();
+        let evt = DashcamEvent {
+            event_type:   EventType::CollisionDetected,
+            timestamp_us: 99_000_000,
+            collision: Some(CollisionPayload { confidence: 0.88, clip_id: 42 }),
+            intent: None, wake: None, llm: None,
+        };
+        let encoded = encode_event(&evt);
+        client.write_all(&encoded).await.unwrap();
+
+        let decoded = server.await.unwrap().unwrap();
+        assert_eq!(decoded.event_type, EventType::CollisionDetected);
+        assert_eq!(decoded.timestamp_us, 99_000_000);
+        let col = decoded.collision.unwrap();
+        assert_eq!(col.clip_id, 42);
+        assert!((col.confidence - 0.88_f32).abs() < 1e-4);
+    }
+
+    // ── Subscribe wire format ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_subscribe_sends_0xff_marker_and_event_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("event_bus3.sock");
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let path_clone = sock_path.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        // EventBus::subscribe sends [0xFF, event_type u32 LE]
+        let stream = tokio::net::UnixStream::connect(&path_clone).await.unwrap();
+        let mut bus = EventBus { stream };
+        bus.subscribe(EventType::CollisionDetected).await.unwrap();
+
+        let received = server.await.unwrap();
+        assert_eq!(received[0], 0xFF, "subscribe marker must be 0xFF");
+        let et = u32::from_le_bytes(received[1..5].try_into().unwrap());
+        assert_eq!(et, EventType::CollisionDetected as u32);
+    }
+
+    // ── EventType values match the C header constants ─────────────────────────
+
+    #[test]
+    fn test_event_type_discriminants_match_c_header() {
+        assert_eq!(EventType::VoiceActivityStart  as u32, 0x01);
+        assert_eq!(EventType::VoiceActivityEnd    as u32, 0x02);
+        assert_eq!(EventType::CollisionPrerollTag as u32, 0x03);
+        assert_eq!(EventType::CollisionDetected   as u32, 0x10);
+        assert_eq!(EventType::ObjectDetected      as u32, 0x11);
+        assert_eq!(EventType::TranscriptReady     as u32, 0x12);
+        assert_eq!(EventType::IntentClassified    as u32, 0x13);
+        assert_eq!(EventType::WakeWordDetected    as u32, 0x14);
+        assert_eq!(EventType::LteConnected        as u32, 0x20);
+        assert_eq!(EventType::LteDisconnected     as u32, 0x21);
+        assert_eq!(EventType::LlmResponseReady    as u32, 0x22);
+        assert_eq!(EventType::UploadComplete      as u32, 0x23);
+        assert_eq!(EventType::SystemDriving       as u32, 0x30);
+        assert_eq!(EventType::SystemParked        as u32, 0x31);
+        assert_eq!(EventType::SystemResumed       as u32, 0x32);
+        assert_eq!(EventType::SuspendRequested    as u32, 0x33);
+        assert_eq!(EventType::SuspendAck          as u32, 0x34);
+    }
+
+    // ── suspend_ack constructor ───────────────────────────────────────────────
+
+    #[test]
+    fn test_suspend_ack_has_no_payloads() {
+        let evt = DashcamEvent::suspend_ack();
+        assert_eq!(evt.event_type, EventType::SuspendAck);
+        assert!(evt.collision.is_none());
+        assert!(evt.intent.is_none());
+        assert!(evt.wake.is_none());
+        assert!(evt.llm.is_none());
+        assert!(evt.timestamp_us > 0, "timestamp must be set");
+    }
+
+    // ── now_us monotonicity ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_now_us_is_monotonic() {
+        let t1 = now_us();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let t2 = now_us();
+        assert!(t2 >= t1, "now_us must be non-decreasing");
+    }
+}

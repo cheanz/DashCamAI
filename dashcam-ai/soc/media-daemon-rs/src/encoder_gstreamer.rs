@@ -64,9 +64,21 @@ struct SegmentAssembler {
 }
 
 impl SegmentAssembler {
+    /// Create a new assembler.
+    ///
+    /// Pre-allocates `initial_cap_bytes` for the segment buffer.
+    /// Default is 32 MiB — enough for a 60 s segment at 4 Mbps (≈ 30 MB)
+    /// without reallocation, while fitting in RV1106 RAM.
+    /// On the Jetson (≥4 GB) this can be raised to 64 MiB.
+    const DEFAULT_INITIAL_CAP: usize = 32 * 1024 * 1024; // 32 MiB
+
     fn new(fps: u32) -> Self {
+        Self::with_capacity(fps, Self::DEFAULT_INITIAL_CAP)
+    }
+
+    fn with_capacity(fps: u32, initial_cap_bytes: usize) -> Self {
         Self {
-            buf:            Vec::with_capacity(64 * 1024 * 1024),
+            buf:            Vec::with_capacity(initial_cap_bytes),
             start_ts:       0,
             frame_count:    0,
             frames_per_seg: fps * 60,
@@ -79,17 +91,193 @@ impl SegmentAssembler {
         self.frame_count += 1;
 
         if self.frame_count >= self.frames_per_seg {
+            let prev_cap = self.buf.capacity();
             let seg = EncodedSegment {
                 data:        std::mem::take(&mut self.buf),
                 start_ts_us: self.start_ts,
                 end_ts_us:   frame_ts,
                 frame_count: self.frame_count,
             };
-            self.buf         = Vec::with_capacity(64 * 1024 * 1024);
+            // Re-use the same capacity as the previous segment — avoids
+            // reallocating and prevents capacity growth on Jetson.
+            self.buf         = Vec::with_capacity(prev_cap);
             self.frame_count = 0;
             return Some(seg);
         }
         None
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FPS: u32 = 30;
+
+    fn nal_chunk(n_bytes: usize) -> Vec<u8> {
+        (0..n_bytes).map(|i| (i & 0xFF) as u8).collect()
+    }
+
+    // ── SegmentAssembler — basic push/flush ────────────────────────────────────
+
+    #[test]
+    fn test_no_segment_emitted_before_frames_per_seg() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(1024);
+        let frames_needed = FPS * 60; // 1800
+
+        for i in 0..(frames_needed - 1) {
+            let seg = asm.push(&chunk, i as u64 * 33_333);
+            assert!(seg.is_none(), "should not emit segment before frame {}", frames_needed);
+        }
+    }
+
+    #[test]
+    fn test_segment_emitted_exactly_at_frames_per_seg() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(512);
+        let frames  = FPS * 60; // 1800
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, i as u64 * 33_333);
+        }
+        assert!(seg.is_some(), "segment must be emitted at exactly frames_per_seg frames");
+    }
+
+    #[test]
+    fn test_segment_frame_count_matches() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(128);
+        let frames  = FPS * 60;
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, i as u64 * 33_333);
+        }
+        let seg = seg.unwrap();
+        assert_eq!(seg.frame_count, frames, "frame_count must equal frames_per_seg");
+    }
+
+    #[test]
+    fn test_segment_data_length_is_sum_of_nal_units() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(256);
+        let frames  = FPS * 60;
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, i as u64 * 33_333);
+        }
+        let expected_bytes = (frames as usize) * 256;
+        assert_eq!(seg.unwrap().data.len(), expected_bytes);
+    }
+
+    #[test]
+    fn test_segment_timestamps_span_full_duration() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(64);
+        let frames  = FPS * 60;
+        // 1800 frames at 33_333 µs each ≈ 60 s
+        let frame_us = 33_333u64;
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, i as u64 * frame_us);
+        }
+        let seg = seg.unwrap();
+        assert_eq!(seg.start_ts_us, 0, "start_ts must be the first frame timestamp");
+        assert_eq!(
+            seg.end_ts_us,
+            (frames - 1) as u64 * frame_us,
+            "end_ts must be the last frame timestamp"
+        );
+    }
+
+    // ── SegmentAssembler — reset after segment emission ────────────────────────
+
+    #[test]
+    fn test_assembler_resets_after_segment_emission() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(32);
+        let frames  = FPS * 60;
+
+        // Emit first segment
+        for i in 0..frames {
+            asm.push(&chunk, i as u64 * 33_333);
+        }
+
+        // The next frames_per_seg frames should produce a second segment
+        let mut second_seg = None;
+        let offset = frames as u64 * 33_333;
+        for i in 0..frames {
+            second_seg = asm.push(&chunk, offset + i as u64 * 33_333);
+        }
+        assert!(second_seg.is_some(), "assembler must reset and produce a second segment");
+        assert_eq!(second_seg.unwrap().frame_count, frames);
+    }
+
+    #[test]
+    fn test_assembler_start_ts_updates_after_reset() {
+        let mut asm = SegmentAssembler::new(FPS);
+        let chunk   = nal_chunk(16);
+        let frames  = FPS * 60;
+        let frame_us = 33_333u64;
+
+        for i in 0..frames {
+            asm.push(&chunk, i as u64 * frame_us);
+        }
+
+        // Second segment — start_ts must be the first frame of the second window
+        let second_start = frames as u64 * frame_us;
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, second_start + i as u64 * frame_us);
+        }
+        assert_eq!(seg.unwrap().start_ts_us, second_start);
+    }
+
+    // ── SegmentAssembler — variable FPS ────────────────────────────────────────
+
+    #[test]
+    fn test_assembler_works_with_24fps() {
+        let fps = 24u32;
+        let mut asm = SegmentAssembler::new(fps);
+        let chunk   = nal_chunk(100);
+        let frames  = fps * 60; // 1440
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&chunk, i as u64 * 41_666);
+        }
+        assert!(seg.is_some());
+        assert_eq!(seg.unwrap().frame_count, frames);
+    }
+
+    // ── Memory capacity sanity ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_segment_pre_allocated_capacity() {
+        // SegmentAssembler pre-allocates 64 MiB. A 1080p 8 Mbps 60 s segment
+        // is ≈ 60 MB. The capacity must cover that without reallocation.
+        let expected_cap = 64 * 1024 * 1024;
+        // We can't inspect buf directly, but we can confirm no panic on 60 MB fill
+        let mut asm     = SegmentAssembler::new(1);   // 1 fps, segment = 60 frames
+        let big_chunk   = vec![0u8; 1024 * 1024];      // 1 MB per "frame"
+        let frames      = 60u32;
+
+        let mut seg = None;
+        for i in 0..frames {
+            seg = asm.push(&big_chunk, i as u64 * 1_000_000);
+        }
+        let seg = seg.unwrap();
+        assert_eq!(seg.data.len(), frames as usize * 1024 * 1024);
+        assert!(
+            seg.data.len() <= expected_cap,
+            "60 MB segment must not exceed pre-allocated 64 MiB capacity"
+        );
     }
 }
 

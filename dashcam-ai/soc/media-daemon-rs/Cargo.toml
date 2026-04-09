@@ -13,6 +13,10 @@ edition = "2021"
 #
 # Exactly one encoder feature must be specified — the build will fail otherwise.
 
+[lib]
+name = "media_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "media-daemon"
 path = "src/main.rs"
@@ -63,8 +67,38 @@ bytes = "1"
 gstreamer     = { version = "0.21", optional = true }
 gstreamer-app = { version = "0.21", optional = true }
 
+[dev-dependencies]
+# Micro-benchmark harness
+criterion      = { version = "0.5", features = ["html_reports"] }
+# Temporary directories for disk I/O tests
+tempfile       = "3"
+# Auto-mock generation for trait boundaries
+mockall        = "0.12"
+# Tokio test macro + in-process Unix socket pairs
+tokio          = { version = "1", features = ["full", "test-util"] }
+
+[[bench]]
+name    = "shm_bench"
+harness = false
+
+[[bench]]
+name    = "encoder_common_bench"
+harness = false
+
+[[bench]]
+name    = "event_bus_bench"
+harness = false
+
+[[bench]]
+name    = "loop_writer_bench"
+harness = false
+
 [profile.release]
 opt-level     = 3
 lto           = true     # Link-time optimisation — important on memory-constrained SoC
 codegen-units = 1        # Single codegen unit for best optimisation
 strip         = true     # Strip debug symbols from release binary
+
+[profile.bench]
+opt-level     = 3
+lto           = false    # Faster bench compile cycles

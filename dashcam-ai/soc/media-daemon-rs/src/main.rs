@@ -1,12 +1,10 @@
-mod capture;
-mod encoder_common;
-#[cfg(feature = "jetson")]   mod encoder_gstreamer;
-#[cfg(feature = "rockchip")] mod encoder_mpp;
-mod encoder;   // thin dispatcher — re-exports the active backend
-mod loop_writer;
-mod audio;
-mod shm;
-mod event_bus;
+// Modules are declared in lib.rs; the binary imports them via `crate::`.
+use crate::capture;
+use crate::encoder;
+use crate::loop_writer;
+use crate::audio;
+use crate::shm;
+use crate::event_bus::{EventBus, DashcamEvent, EventType};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -17,7 +15,6 @@ use tracing::{info, error};
 
 use capture::RawFrame;
 use encoder::EncodedSegment;
-use event_bus::{EventBus, DashcamEvent, EventType};
 
 // ── Channel capacities ────────────────────────────────────────────────────────
 
@@ -26,7 +23,15 @@ use event_bus::{EventBus, DashcamEvent, EventType};
 const RAW_FRAME_CAP: usize  = 4;
 
 /// Encoded segment ring — encoder → loop writer.
-const ENCODED_SEG_CAP: usize = 8;
+///
+/// Memory budget (RV1106, ~256 MB RAM):
+///   At 4 Mbps / 60 s each segment is ≈ 30 MB.
+///   ENCODED_SEG_CAP = 4 → 4 × 30 MB = 120 MB peak in-flight — safe.
+///
+///   The previous value of 8 (× 64 MB pre-alloc = 512 MB) exceeded the
+///   RV1106's physical RAM.  On the Jetson (≥4 GB) 8 is fine, but we
+///   keep the conservative value for both targets.
+const ENCODED_SEG_CAP: usize = 4;   // was 8 — reduced to fit RV1106 RAM budget
 
 /// Audio chunk ring — ALSA → ai-daemon socket sender.
 const AUDIO_CHUNK_CAP: usize = 16;
@@ -75,7 +80,7 @@ fn main() -> Result<()> {
             }
         })?;
 
-    // 2. Encoder thread — raw NV12 → H.264 via Rockchip MPP
+    // 2. Encoder thread — raw NV12 → H.264 via Rockchip MPP or GStreamer
     let sd_encoder = Arc::clone(&shutdown);
     let encoder_handle = thread::Builder::new()
         .name("encoder".into())
@@ -136,8 +141,8 @@ fn main() -> Result<()> {
             tokio::select! {
                 event = bus.next_event() => {
                     match event {
-                        Ok(DashcamEvent { event_type: EventType::CollisionDetected, data }) => {
-                            let clip_id = data.collision.map(|c| c.clip_id).unwrap_or(0);
+                        Ok(DashcamEvent { event_type: EventType::CollisionDetected, collision, .. }) => {
+                            let clip_id = collision.map(|c| c.clip_id).unwrap_or(0);
                             loop_writer::tag_preroll(clip_id);
                             info!("collision detected — clip {clip_id} tagged for preservation");
                         }
@@ -170,11 +175,9 @@ fn main() -> Result<()> {
 }
 
 fn install_signal_handler(shutdown: Arc<AtomicBool>) {
-    // SIGTERM / SIGINT → set shutdown flag
-    // Uses nix::sys::signal in a background thread
+    // SIGTERM / SIGINT → set shutdown flag via sigprocmask + sigwait
     thread::spawn(move || {
         use nix::sys::signal::{self, Signal};
-        use nix::unistd::pause;
         let mut mask = signal::SigSet::empty();
         mask.add(Signal::SIGTERM);
         mask.add(Signal::SIGINT);
